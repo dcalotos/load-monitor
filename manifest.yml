@@ -16,6 +16,10 @@ resources:
 permissions:
   scopes:
     - read:jira-work
+  external:
+    fetch:
+      backend:
+        - address: https://api.openai.com
 app:
   runtime:
     name: nodejs24.x
