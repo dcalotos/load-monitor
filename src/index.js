@@ -437,4 +437,420 @@ resolver.define('saveCurrentIssueScore', async (req) => {
   }
 });
 
+// ============================================
+// AI-POWERED TICKET LOAD EVALUATION SYSTEM
+// Evaluates tickets based on 4 pillars with weighted scoring
+// ============================================
+
+/**
+ * Resolver to evaluate a ticket's cognitive load using AI
+ * 
+ * This resolver analyzes a Jira ticket based on 4 key pillars:
+ * - Ambigüedad (30%): Clarity of requirements and description
+ * - Complejidad Técnica (40%): Technical complexity and core system involvement
+ * - Riesgo de Context Switching (20%): Required knowledge across multiple system areas
+ * - Deuda Técnica (10%): Legacy code and technical debt involvement
+ * 
+ * Returns a score from 1-10 with detailed breakdown and automatically stores the result
+ * 
+ * @param {Object} req - The request object with issue context
+ * @returns {Object} Evaluation results with score, breakdown, and storage confirmation
+ */
+resolver.define('evaluateTicketLoad', async (req) => {
+  try {
+    const issueKey = req.context.extension.issue.key;
+
+    if (!issueKey) {
+      return { error: 'Issue context not found', success: false };
+    }
+
+    console.log(`Starting ticket load evaluation for ${issueKey}`);
+
+    // Fetch comprehensive issue details from Jira
+    const res = await api.asUser().requestJira(
+      route`/rest/api/3/issue/${issueKey}?fields=summary,description,labels,priority,status,issuetype,components,customfield_10020`
+    );
+
+    const data = await res.json();
+
+    // Extract issue information
+    const summary = data.fields.summary || 'No summary';
+    const description = data.fields.description || 'No description provided';
+    const labels = data.fields.labels?.join(', ') || 'None';
+    const priority = data.fields.priority?.name || 'Not set';
+    const status = data.fields.status?.name || 'Unknown';
+    const issueType = data.fields.issuetype?.name || 'Unknown';
+    const components = data.fields.components?.map(c => c.name).join(', ') || 'None';
+
+    // Get the API key from environment variables
+    const apiKey = process.env.OPENAI_API_KEY;
+    
+    if (!apiKey) {
+      console.error('OpenAI API key not found in environment variables');
+      return { error: 'API key not configured', success: false };
+    }
+
+    // Construct the specialized prompt for the AI evaluation
+    const systemPrompt = `Actúa como un Senior Technical Program Manager. Tu tarea es analizar tickets de Jira y evaluar su carga cognitiva bajo 4 pilares específicos.
+
+PILARES DE EVALUACIÓN:
+1. Ambigüedad (30%): ¿La descripción es clara o faltan requisitos? ¿Los criterios de aceptación están bien definidos? A mayor ambigüedad, más carga cognitiva.
+
+2. Complejidad Técnica (40%): ¿Involucra cambios en el "core" del sistema, refactorización profunda o integraciones críticas? ¿Afecta lógica de negocio crítica como pagos, seguridad o autenticación?
+
+3. Riesgo de Context Switching (20%): ¿El ticket requiere conocimientos de múltiples áreas del sistema a la vez? ¿Necesita cambios en frontend, backend, base de datos y terceros simultáneamente?
+
+4. Deuda Técnica (10%): ¿El ticket menciona "legacy code", "fixes" temporales, código antiguo o workarounds? ¿Requiere lidiar con código heredado?
+
+CRITERIOS DE PUNTUACIÓN (1-10):
+- 1-3: Tareas mecánicas (cambios de UI menores, documentación, textos, configuraciones simples)
+- 4-6: Desarrollo estándar (nuevas features pequeñas, bugs localizados en un área específica)
+- 7-8: Alta carga (arquitectura, múltiples áreas, integraciones complejas)
+- 9-10: Carga crítica (bugs intermitentes, cambios en lógica de pagos/seguridad/core, refactorizaciones masivas)
+
+Debes devolver ÚNICAMENTE un JSON válido con este formato exacto:
+{
+  "score": <número del 1 al 10>,
+  "reason": "<explicación breve en máximo 15 palabras>",
+  "breakdown": {
+    "ambiguity": <número del 1 al 10>,
+    "technical_complexity": <número del 1 al 10>,
+    "context_switching": <número del 1 al 10>,
+    "technical_debt": <número del 1 al 10>
+  }
+}`;
+
+    const userPrompt = `Analiza este ticket de Jira:
+
+TIPO: ${issueType}
+TÍTULO: ${summary}
+DESCRIPCIÓN: ${description}
+PRIORIDAD: ${priority}
+ESTADO: ${status}
+ETIQUETAS: ${labels}
+COMPONENTES: ${components}
+
+Evalúa este ticket según los 4 pilares y devuelve el JSON con el score final y el desglose.`;
+
+    // Initialize OpenAI client
+    const openai = new OpenAI({
+      apiKey: apiKey,
+    });
+
+    console.log(`Calling OpenAI for ticket evaluation: ${issueKey}`);
+
+    // Call OpenAI API with structured output
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      max_tokens: 500,
+      temperature: 0.3, // Lower temperature for more consistent scoring
+      response_format: { type: 'json_object' } // Force JSON response
+    });
+
+    const aiResponse = completion.choices[0].message.content;
+    console.log(`AI Response for ${issueKey}:`, aiResponse);
+
+    // Parse the AI response
+    let evaluation;
+    try {
+      evaluation = JSON.parse(aiResponse);
+    } catch (parseError) {
+      console.error('Failed to parse AI response as JSON:', parseError);
+      return {
+        error: 'Failed to parse AI evaluation response',
+        success: false,
+        rawResponse: aiResponse
+      };
+    }
+
+    // Validate the evaluation structure
+    if (!evaluation.score || !evaluation.reason || !evaluation.breakdown) {
+      console.error('Invalid evaluation structure:', evaluation);
+      return {
+        error: 'Invalid evaluation structure from AI',
+        success: false,
+        evaluation: evaluation
+      };
+    }
+
+    // Ensure score is within valid range
+    const finalScore = Math.min(10, Math.max(1, Math.round(evaluation.score)));
+
+    // Prepare metadata with detailed breakdown
+    const metadata = {
+      evaluationMethod: 'ai-4-pillars',
+      breakdown: {
+        ambiguity: evaluation.breakdown.ambiguity || 0,
+        technicalComplexity: evaluation.breakdown.technical_complexity || 0,
+        contextSwitching: evaluation.breakdown.context_switching || 0,
+        technicalDebt: evaluation.breakdown.technical_debt || 0
+      },
+      weights: {
+        ambiguity: '30%',
+        technicalComplexity: '40%',
+        contextSwitching: '20%',
+        technicalDebt: '10%'
+      },
+      reason: evaluation.reason,
+      issueType: issueType,
+      priority: priority,
+      evaluatedAt: new Date().toISOString(),
+      tokensUsed: completion.usage.total_tokens,
+      model: 'gpt-4o-mini'
+    };
+
+    console.log(`Evaluation complete for ${issueKey}. Score: ${finalScore}`);
+
+    // Automatically save the score to storage
+    const scoreData = {
+      issueKey: issueKey,
+      score: finalScore,
+      metadata: metadata,
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.context.accountId,
+    };
+
+    const storageKey = `ticket-score:${issueKey}`;
+    await storage.set(storageKey, scoreData);
+
+    console.log(`Score ${finalScore} saved to storage for ${issueKey}`);
+
+    return {
+      success: true,
+      issueKey: issueKey,
+      score: finalScore,
+      reason: evaluation.reason,
+      breakdown: {
+        ambiguity: evaluation.breakdown.ambiguity || 0,
+        technicalComplexity: evaluation.breakdown.technical_complexity || 0,
+        contextSwitching: evaluation.breakdown.context_switching || 0,
+        technicalDebt: evaluation.breakdown.technical_debt || 0
+      },
+      weights: {
+        ambiguity: '30%',
+        technicalComplexity: '40%',
+        contextSwitching: '20%',
+        technicalDebt: '10%'
+      },
+      metadata: metadata,
+      stored: true,
+      message: `Ticket evaluated and score saved: ${finalScore}/10`
+    };
+
+  } catch (error) {
+    console.error('Error evaluating ticket load:', error);
+    return {
+      error: error.message || 'Failed to evaluate ticket load',
+      success: false,
+      details: error.stack
+    };
+  }
+});
+
+/**
+ * Resolver to evaluate a specific ticket by issue key
+ * Same as evaluateTicketLoad but accepts an issue key as parameter
+ * 
+ * @param {Object} req - The request object with payload containing issueKey
+ * @returns {Object} Evaluation results with score, breakdown, and storage confirmation
+ */
+resolver.define('evaluateTicketByKey', async (req) => {
+  try {
+    const { issueKey } = req.payload;
+
+    if (!issueKey) {
+      return { error: 'Issue key is required', success: false };
+    }
+
+    console.log(`Starting ticket load evaluation for ${issueKey}`);
+
+    // Fetch comprehensive issue details from Jira
+    const res = await api.asUser().requestJira(
+      route`/rest/api/3/issue/${issueKey}?fields=summary,description,labels,priority,status,issuetype,components,customfield_10020`
+    );
+
+    const data = await res.json();
+
+    // Extract issue information
+    const summary = data.fields.summary || 'No summary';
+    const description = data.fields.description || 'No description provided';
+    const labels = data.fields.labels?.join(', ') || 'None';
+    const priority = data.fields.priority?.name || 'Not set';
+    const status = data.fields.status?.name || 'Unknown';
+    const issueType = data.fields.issuetype?.name || 'Unknown';
+    const components = data.fields.components?.map(c => c.name).join(', ') || 'None';
+
+    // Get the API key from environment variables
+    const apiKey = process.env.OPENAI_API_KEY;
+    
+    if (!apiKey) {
+      console.error('OpenAI API key not found in environment variables');
+      return { error: 'API key not configured', success: false };
+    }
+
+    // Construct the specialized prompt for the AI evaluation
+    const systemPrompt = `Actúa como un Senior Technical Program Manager. Tu tarea es analizar tickets de Jira y evaluar su carga cognitiva bajo 4 pilares específicos.
+
+PILARES DE EVALUACIÓN:
+1. Ambigüedad (30%): ¿La descripción es clara o faltan requisitos? ¿Los criterios de aceptación están bien definidos? A mayor ambigüedad, más carga cognitiva.
+
+2. Complejidad Técnica (40%): ¿Involucra cambios en el "core" del sistema, refactorización profunda o integraciones críticas? ¿Afecta lógica de negocio crítica como pagos, seguridad o autenticación?
+
+3. Riesgo de Context Switching (20%): ¿El ticket requiere conocimientos de múltiples áreas del sistema a la vez? ¿Necesita cambios en frontend, backend, base de datos y terceros simultáneamente?
+
+4. Deuda Técnica (10%): ¿El ticket menciona "legacy code", "fixes" temporales, código antiguo o workarounds? ¿Requiere lidiar con código heredado?
+
+CRITERIOS DE PUNTUACIÓN (1-10):
+- 1-3: Tareas mecánicas (cambios de UI menores, documentación, textos, configuraciones simples)
+- 4-6: Desarrollo estándar (nuevas features pequeñas, bugs localizados en un área específica)
+- 7-8: Alta carga (arquitectura, múltiples áreas, integraciones complejas)
+- 9-10: Carga crítica (bugs intermitentes, cambios en lógica de pagos/seguridad/core, refactorizaciones masivas)
+
+Debes devolver ÚNICAMENTE un JSON válido con este formato exacto:
+{
+  "score": <número del 1 al 10>,
+  "reason": "<explicación breve en máximo 15 palabras>",
+  "breakdown": {
+    "ambiguity": <número del 1 al 10>,
+    "technical_complexity": <número del 1 al 10>,
+    "context_switching": <número del 1 al 10>,
+    "technical_debt": <número del 1 al 10>
+  }
+}`;
+
+    const userPrompt = `Analiza este ticket de Jira:
+
+TIPO: ${issueType}
+TÍTULO: ${summary}
+DESCRIPCIÓN: ${description}
+PRIORIDAD: ${priority}
+ESTADO: ${status}
+ETIQUETAS: ${labels}
+COMPONENTES: ${components}
+
+Evalúa este ticket según los 4 pilares y devuelve el JSON con el score final y el desglose.`;
+
+    // Initialize OpenAI client
+    const openai = new OpenAI({
+      apiKey: apiKey,
+    });
+
+    console.log(`Calling OpenAI for ticket evaluation: ${issueKey}`);
+
+    // Call OpenAI API with structured output
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      max_tokens: 500,
+      temperature: 0.3,
+      response_format: { type: 'json_object' }
+    });
+
+    const aiResponse = completion.choices[0].message.content;
+    console.log(`AI Response for ${issueKey}:`, aiResponse);
+
+    // Parse the AI response
+    let evaluation;
+    try {
+      evaluation = JSON.parse(aiResponse);
+    } catch (parseError) {
+      console.error('Failed to parse AI response as JSON:', parseError);
+      return {
+        error: 'Failed to parse AI evaluation response',
+        success: false,
+        rawResponse: aiResponse
+      };
+    }
+
+    // Validate the evaluation structure
+    if (!evaluation.score || !evaluation.reason || !evaluation.breakdown) {
+      console.error('Invalid evaluation structure:', evaluation);
+      return {
+        error: 'Invalid evaluation structure from AI',
+        success: false,
+        evaluation: evaluation
+      };
+    }
+
+    // Ensure score is within valid range
+    const finalScore = Math.min(10, Math.max(1, Math.round(evaluation.score)));
+
+    // Prepare metadata with detailed breakdown
+    const metadata = {
+      evaluationMethod: 'ai-4-pillars',
+      breakdown: {
+        ambiguity: evaluation.breakdown.ambiguity || 0,
+        technicalComplexity: evaluation.breakdown.technical_complexity || 0,
+        contextSwitching: evaluation.breakdown.context_switching || 0,
+        technicalDebt: evaluation.breakdown.technical_debt || 0
+      },
+      weights: {
+        ambiguity: '30%',
+        technicalComplexity: '40%',
+        contextSwitching: '20%',
+        technicalDebt: '10%'
+      },
+      reason: evaluation.reason,
+      issueType: issueType,
+      priority: priority,
+      evaluatedAt: new Date().toISOString(),
+      tokensUsed: completion.usage.total_tokens,
+      model: 'gpt-4o-mini'
+    };
+
+    console.log(`Evaluation complete for ${issueKey}. Score: ${finalScore}`);
+
+    // Automatically save the score to storage
+    const scoreData = {
+      issueKey: issueKey,
+      score: finalScore,
+      metadata: metadata,
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.context.accountId,
+    };
+
+    const storageKey = `ticket-score:${issueKey}`;
+    await storage.set(storageKey, scoreData);
+
+    console.log(`Score ${finalScore} saved to storage for ${issueKey}`);
+
+    return {
+      success: true,
+      issueKey: issueKey,
+      score: finalScore,
+      reason: evaluation.reason,
+      breakdown: {
+        ambiguity: evaluation.breakdown.ambiguity || 0,
+        technicalComplexity: evaluation.breakdown.technical_complexity || 0,
+        contextSwitching: evaluation.breakdown.context_switching || 0,
+        technicalDebt: evaluation.breakdown.technical_debt || 0
+      },
+      weights: {
+        ambiguity: '30%',
+        technicalComplexity: '40%',
+        contextSwitching: '20%',
+        technicalDebt: '10%'
+      },
+      metadata: metadata,
+      stored: true,
+      message: `Ticket evaluated and score saved: ${finalScore}/10`
+    };
+
+  } catch (error) {
+    console.error('Error evaluating ticket load:', error);
+    return {
+      error: error.message || 'Failed to evaluate ticket load',
+      success: false,
+      details: error.stack
+    };
+  }
+});
+
 export const handler = resolver.getDefinitions();
