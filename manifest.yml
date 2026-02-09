@@ -12,7 +12,7 @@ modules:
       handler: index.handler
 resources:
   - key: main
-    path: static/hello-world/build
+    path: static/load-monitor/build
 permissions:
   scopes:
     - read:jira-work
