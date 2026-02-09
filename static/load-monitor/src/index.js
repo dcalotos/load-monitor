@@ -1,12 +1,12 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
-import App from './App';
+import LoadMonitor from './LoadMonitor';
 
 import '@atlaskit/css-reset';
 
 ReactDOM.render(
   <React.StrictMode>
-    <App />
+    <LoadMonitor />
   </React.StrictMode>,
   document.getElementById('root')
 );

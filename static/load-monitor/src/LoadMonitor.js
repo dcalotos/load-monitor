@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { events, invoke } from '@forge/bridge';
 
-function App() {
+function LoadMonitor() {
   const [data, setData] = useState(null);
 
   const handleFetchSuccess = (data) => {
@@ -40,4 +40,4 @@ function App() {
   );
 }
 
-export default App;
+export default LoadMonitor;
